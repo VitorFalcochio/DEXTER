@@ -1,0 +1,1 @@
+pip install opencv-python mediapipe numpy PyOpenGL PyOpenGL_accelerate modernGL pyttsx3 SpeechRecognition scipy

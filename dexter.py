@@ -1,148 +1,77 @@
+import sys
 import cv2
-import mediapipe as mp
-import numpy as np
-import json
-import math
 import time
+import math
+import numpy as np
+from datetime import datetime
+
+from PyQt6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QLabel,
+    QVBoxLayout,
+    QHBoxLayout,
+    QWidget,
+    QPushButton,
+    QFrame,
+    QSizePolicy,
+    QTextEdit,
+)
+from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+
+from vision import VisionEngine, GestureState
+from holograms import HologramEngine, rot_matrix_x, rot_matrix_y, smooth_vec3, clamp, project
+from ui import UIOverlay, point_in_rect
 
 
-# =========================================================
-# CONFIG
-# =========================================================
 class Config:
-    WINDOW_NAME = "DEXTER v14.0"
-    SCENE_FILE = "dexter_scene_v14.json"
-
+    WINDOW_NAME = "DEXTER v19.0 // ARUCO WORLD ANCHOR ONLINE"
     CAMERA_INDEX = 0
 
-    MAX_NUM_HANDS = 2
-    HAND_DET_CONF = 0.7
-    HAND_TRACK_CONF = 0.7
+    MAX_NUM_HANDS, HAND_DET_CONF, HAND_TRACK_CONF = 2, 0.7, 0.7
+    MAX_NUM_FACES, FACE_DET_CONF, FACE_TRACK_CONF = 1, 0.7, 0.7
+    FACE_SMOOTH, HAND_SMOOTH, OBJ_DRAG_SMOOTH = 0.12, 0.25, 0.34
+    PINCH_THRESHOLD, DEPTH_SCALE, DEPTH_OFFSET, DEPTH_MIN, DEPTH_MAX = 45, 2.5, -0.5, -1.0, 1.0
+    BASE_ROT_X, BASE_ROT_Y, P_SENSITIVITY, FOV = 0.15, -0.3, 0.8, 0.8
+    PICK_RADIUS, MIN_SCALE, MAX_SCALE = 95, 0.05, 2.8
+    CREATE_CUBE_BTN, CREATE_CORE_BTN, DELETE_BTN = (40, 40, 78, 62), (130, 40, 78, 62), (220, 40, 78, 62)
 
-    MAX_NUM_FACES = 1
-    FACE_DET_CONF = 0.7
-    FACE_TRACK_CONF = 0.7
+    STARK_BLUE, STARK_EDGE, STARK_SOFT = (255, 160, 60), (255, 230, 150), (180, 120, 50)
+    WHITE_SOFT, GREEN_SOFT, CYAN_SOFT = (220, 220, 220), (120, 255, 160), (255, 255, 140)
+    PANEL_BG = (24, 28, 34)
+    HUD_TITLE = "DEXTER // AR CORE ONLINE"
 
-    FACE_SMOOTH = 0.12
-    HAND_SMOOTH = 0.25
-    OBJ_DRAG_SMOOTH = 0.34
+    GRAVITY = 0.015
+    FRICTION = 0.92
+    BOUNCE = 0.6
+    FLOOR_Y = 0.82
 
-    PINCH_THRESHOLD = 45
-    DEPTH_SCALE = 2.5
-    DEPTH_OFFSET = -0.5
-    DEPTH_MIN = -1.0
-    DEPTH_MAX = 1.0
-
-    BASE_ROT_X = 0.15
-    BASE_ROT_Y = -0.3
-    P_SENSITIVITY = 0.8
-    FOV = 0.8
-
-    PICK_RADIUS = 95
-    MIN_SCALE = 0.05
-    MAX_SCALE = 2.8
-
-    CREATE_CUBE_BTN = (40, 40, 78, 62)
-    CREATE_PYRAMID_BTN = (130, 40, 78, 62)
-    DELETE_BTN = (220, 40, 78, 62)
-
-    HUD_TITLE = "DEXTER v14.0 // CLEAN ARCHITECTURE EDITION"
-
-    STARK_BLUE = (255, 160, 60)
-    STARK_EDGE = (255, 230, 150)
-    STARK_SOFT = (180, 120, 50)
-    WHITE_SOFT = (220, 220, 220)
-    RED_SOFT = (80, 80, 255)
-    GREEN_SOFT = (120, 255, 120)
-    CYAN_SOFT = (255, 220, 120)
-    PANEL_BG = (35, 25, 10)
-    SHADOW_COLOR = (30, 20, 10)
-    GRID_COLOR = (80, 60, 25)
+    ARUCO_DICT = cv2.aruco.DICT_4X4_50 if hasattr(cv2, "aruco") else None
+    ARUCO_TARGET_ID = 0
+    ARUCO_MARKER_LENGTH_M = 0.06
+    ANCHOR_SMOOTH = 0.35
+    ANCHOR_MAX_MISSES = 18
+    CAMERA_FOCAL_SCALE = 1.05
+    MARKER_DRAG_PLANE_Z = 0.0
+    DRAW_ANCHOR_AXES = True
 
 
-# =========================================================
-# HELPERS
-# =========================================================
-def clamp(v, lo, hi):
-    return max(lo, min(hi, v))
+class VideoWorker(QThread):
+    frame_ready = pyqtSignal(QImage)
+    stats_ready = pyqtSignal(int)
+    log_msg = pyqtSignal(str)
+    telemetry_ready = pyqtSignal(dict)
 
-
-def smooth_value(current, target, alpha):
-    return current * (1.0 - alpha) + target * alpha
-
-
-def smooth_vec3(current, target, alpha):
-    if current is None:
-        return list(target)
-    return [
-        current[0] * (1.0 - alpha) + target[0] * alpha,
-        current[1] * (1.0 - alpha) + target[1] * alpha,
-        current[2] * (1.0 - alpha) + target[2] * alpha,
-    ]
-
-
-def safe_normal(v):
-    norm = np.linalg.norm(v)
-    if norm < 1e-6:
-        return np.array([0.0, 0.0, 1.0], dtype=np.float32)
-    return v / norm
-
-
-def point_in_rect(pt, rect):
-    x, y = pt
-    rx, ry, rw, rh = rect
-    return rx <= x <= rx + rw and ry <= y <= ry + rh
-
-
-def project(pt3d, w, h, fov=0.8):
-    x, y, z = pt3d
-    denom = 1.0 + z * fov
-    if denom <= 0.01:
-        denom = 0.01
-    sx = int((x / denom) * w * 0.5 + w * 0.5)
-    sy = int((y / denom) * h * 0.5 + h * 0.5)
-    return sx, sy
-
-
-def rot_matrix_x(a):
-    return np.array([
-        [1, 0, 0],
-        [0, np.cos(a), -np.sin(a)],
-        [0, np.sin(a),  np.cos(a)]
-    ], dtype=np.float32)
-
-
-def rot_matrix_y(a):
-    return np.array([
-        [ np.cos(a), 0, np.sin(a)],
-        [0,          1, 0],
-        [-np.sin(a), 0, np.cos(a)]
-    ], dtype=np.float32)
-
-
-# =========================================================
-# GESTURE STATE
-# =========================================================
-class GestureState:
     def __init__(self):
-        self.prev_grabbing = False
-        self.current_grabbing = False
-        self.grab_started = False
-        self.grab_ended = False
-
-    def update(self, grabbing):
-        self.current_grabbing = grabbing
-        self.grab_started = grabbing and not self.prev_grabbing
-        self.grab_ended = self.prev_grabbing and not grabbing
-        self.prev_grabbing = grabbing
-
-
-# =========================================================
-# APP
-# =========================================================
-class DexterApp:
-    def __init__(self):
+        super().__init__()
         self.cfg = Config()
+        self.vision = VisionEngine(self.cfg)
+        self.holo = HologramEngine(self.cfg)
+        self.ui = UIOverlay(self.cfg)
+
+        self.cap = cv2.VideoCapture(self.cfg.CAMERA_INDEX)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         self.objects_3d = []
         self.selected_obj_index = -1
@@ -150,669 +79,571 @@ class DexterApp:
 
         self.face_offset_x = 0.0
         self.face_offset_y = 0.0
-
         self.last_hand_pos3d = None
         self.gesture = GestureState()
-
-        self.base_dist_scaling = None
-        self.base_scale_obj = None
+        self.base_dist = None
+        self.base_scale = None
+        self.base_angle = None
+        self.base_rot_z = None
 
         self.black_bg_mode = False
         self.hud_flash = 0.0
+        self.running = True
 
-        self.mp_hands = mp.solutions.hands
-        self.mp_face_mesh = mp.solutions.face_mesh
+        self.cmd_spawn = None
+        self.cmd_clear = False
+        self.cmd_toggle_bg = False
+        self.pending_spawn_drag = False
+        self.last_time = time.time()
 
-        self.hands = self.mp_hands.Hands(
-            max_num_hands=self.cfg.MAX_NUM_HANDS,
-            min_detection_confidence=self.cfg.HAND_DET_CONF,
-            min_tracking_confidence=self.cfg.HAND_TRACK_CONF
+        self.camera_matrix = None
+        self.dist_coeffs = np.zeros((5, 1), dtype=np.float32)
+        self.frame_size = None
+
+        self.anchor_rvec = None
+        self.anchor_tvec = None
+        self.anchor_id = None
+        self.anchor_visible = False
+        self.anchor_miss_count = 0
+
+    def stop(self):
+        self.running = False
+        self.wait()
+
+    def _has_anchor_pose(self):
+        return self.anchor_rvec is not None and self.anchor_tvec is not None and self.camera_matrix is not None
+
+    def _ensure_camera_matrix(self, w, h):
+        if self.frame_size == (w, h) and self.camera_matrix is not None:
+            return
+        focal = float(max(w, h) * self.cfg.CAMERA_FOCAL_SCALE)
+        self.camera_matrix = np.array(
+            [
+                [focal, 0.0, w * 0.5],
+                [0.0, focal, h * 0.5],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
         )
+        self.frame_size = (w, h)
 
-        self.face_mesh = self.mp_face_mesh.FaceMesh(
-            max_num_faces=self.cfg.MAX_NUM_FACES,
-            min_detection_confidence=self.cfg.FACE_DET_CONF,
-            min_tracking_confidence=self.cfg.FACE_TRACK_CONF
-        )
-
-        self.cap = cv2.VideoCapture(self.cfg.CAMERA_INDEX)
-        if not self.cap.isOpened():
-            raise RuntimeError("Não foi possível acessar a câmera.")
-
-        cv2.namedWindow(self.cfg.WINDOW_NAME)
-
-    # -----------------------------------------------------
-    # Scene / persistence
-    # -----------------------------------------------------
-    def create_object(self, obj_type, pos3d):
-        color = self.cfg.STARK_BLUE if obj_type == "cube" else self.cfg.CYAN_SOFT
-        obj = {
-            "type": obj_type,
-            "pos": list(pos3d),
-            "scale": 0.35,
-            "color": color,
-            "bbox": (0, 0, 0, 0),
-            "spawn_t": time.time()
-        }
-        self.objects_3d.append(obj)
-        self.hud_flash = 1.0
-        return len(self.objects_3d) - 1
-
-    def save_scene(self):
-        data = []
-        for obj in self.objects_3d:
-            data.append({
-                "type": obj.get("type", "cube"),
-                "pos": [float(v) for v in obj["pos"]],
-                "scale": float(obj["scale"]),
-                "color": list(obj["color"]),
-                "spawn_t": float(obj.get("spawn_t", time.time()))
-            })
-        with open(self.cfg.SCENE_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        print("💾 Cena salva.")
-
-    def load_scene(self):
-        try:
-            with open(self.cfg.SCENE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-
-            loaded = []
-            for item in data:
-                loaded.append({
-                    "type": item.get("type", "cube"),
-                    "pos": list(item.get("pos", [0.0, 0.0, 0.0])),
-                    "scale": float(item.get("scale", 0.35)),
-                    "color": tuple(item.get("color", self.cfg.STARK_BLUE)),
-                    "bbox": (0, 0, 0, 0),
-                    "spawn_t": float(item.get("spawn_t", time.time()))
-                })
-
-            self.objects_3d = loaded
-            self.selected_obj_index = -1
-            self.drag_obj_index = -1
-            print("💾 Cena carregada.")
-        except FileNotFoundError:
-            print("⚠️ Arquivo de cena não encontrado.")
-        except Exception as e:
-            print(f"❌ Erro ao carregar cena: {e}")
-
-    # -----------------------------------------------------
-    # Geometry
-    # -----------------------------------------------------
-    def get_cube_geometry(self, obj):
-        s = obj["scale"] / 2.0
-        px, py, pz = obj["pos"]
-
-        verts = np.array([
-            [-s, -s, -s],
-            [ s, -s, -s],
-            [ s,  s, -s],
-            [-s,  s, -s],
-            [-s, -s,  s],
-            [ s, -s,  s],
-            [ s,  s,  s],
-            [-s,  s,  s]
-        ], dtype=np.float32)
-
-        verts += np.array([px, py, pz], dtype=np.float32)
-
-        faces = [
-            [0, 1, 2, 3],
-            [4, 5, 6, 7],
-            [0, 1, 5, 4],
-            [2, 3, 7, 6],
-            [0, 3, 7, 4],
-            [1, 2, 6, 5]
-        ]
-        return verts, faces
-
-    def get_pyramid_geometry(self, obj):
-        s = obj["scale"] / 2.0
-        px, py, pz = obj["pos"]
-
-        verts = np.array([
-            [-s,  s, -s],
-            [ s,  s, -s],
-            [ s,  s,  s],
-            [-s,  s,  s],
-            [ 0, -s, 0],
-        ], dtype=np.float32)
-
-        verts += np.array([px, py, pz], dtype=np.float32)
-
-        faces = [
-            [0, 1, 2, 3],
-            [0, 1, 4],
-            [1, 2, 4],
-            [2, 3, 4],
-            [3, 0, 4]
-        ]
-        return verts, faces
-
-    def get_geometry(self, obj):
-        obj_type = obj.get("type", "cube")
-        if obj_type == "pyramid":
-            return self.get_pyramid_geometry(obj)
-        return self.get_cube_geometry(obj)
-
-    def get_object_center_projected(self, obj, R, w, h):
-        center = np.array(obj["pos"], dtype=np.float32)
-        rotated = R @ center
-        return project(rotated, w, h, self.cfg.FOV)
-
-    # -----------------------------------------------------
-    # Tracking
-    # -----------------------------------------------------
-    def process_face(self, rgb_frame):
-        res_face = self.face_mesh.process(rgb_frame)
-        if res_face.multi_face_landmarks:
-            face_landmarks = res_face.multi_face_landmarks[0]
-            center_eye = face_landmarks.landmark[168]
-
-            target_x = ((center_eye.x) * 2.0 - 1.0) * self.cfg.P_SENSITIVITY
-            target_y = ((center_eye.y) * 2.0 - 1.0) * self.cfg.P_SENSITIVITY
-
-            self.face_offset_x = smooth_value(self.face_offset_x, target_x, self.cfg.FACE_SMOOTH)
-            self.face_offset_y = smooth_value(self.face_offset_y, target_y, self.cfg.FACE_SMOOTH)
-
-    def process_hands(self, rgb_frame, w, h):
-        res_hands = self.hands.process(rgb_frame)
-        hand_data = []
-
-        if res_hands.multi_hand_landmarks:
-            for hand_lms in res_hands.multi_hand_landmarks:
-                idx = hand_lms.landmark[8]
-                thumb = hand_lms.landmark[4]
-                wrist = hand_lms.landmark[0]
-                mid_base = hand_lms.landmark[9]
-
-                ix, iy = int(idx.x * w), int(idx.y * h)
-                tx, ty = int(thumb.x * w), int(thumb.y * h)
-
-                dist_pinch = math.hypot(tx - ix, ty - iy)
-                grabbing = dist_pinch < self.cfg.PINCH_THRESHOLD
-
-                hand_span = math.hypot(wrist.x - mid_base.x, wrist.y - mid_base.y)
-                z_val = clamp(
-                    hand_span * self.cfg.DEPTH_SCALE + self.cfg.DEPTH_OFFSET,
-                    self.cfg.DEPTH_MIN,
-                    self.cfg.DEPTH_MAX
-                )
-
-                x3d = idx.x * 2.0 - 1.0
-                y3d = -(idx.y * 2.0 - 1.0)
-
-                hand_data.append({
-                    "px": (ix, iy),
-                    "pos3d": [x3d, y3d, z_val],
-                    "grabbing": grabbing
-                })
-
-        return hand_data
-
-    # -----------------------------------------------------
-    # Interaction
-    # -----------------------------------------------------
-    def get_scene_rotation(self):
-        return rot_matrix_x(self.cfg.BASE_ROT_X + self.face_offset_y) @ rot_matrix_y(self.cfg.BASE_ROT_Y - self.face_offset_x)
-
-    def pick_nearest_object(self, hand_px, R, w, h, radius=None):
-        if radius is None:
-            radius = self.cfg.PICK_RADIUS
-
-        best_idx = -1
-        best_dist = 999999.0
-
-        for i, obj in enumerate(self.objects_3d):
-            cx, cy = self.get_object_center_projected(obj, R, w, h)
-            d = math.hypot(hand_px[0] - cx, hand_px[1] - cy)
-            if d < radius and d < best_dist:
-                best_dist = d
-                best_idx = i
-
-        return best_idx
-
-    def reset_scaling_state(self):
-        self.base_dist_scaling = None
-        self.base_scale_obj = None
-
-    def handle_interaction(self, primary_hand, hand_data, R, w, h):
-        current_grabbing = primary_hand["grabbing"] if primary_hand else False
-        self.gesture.update(current_grabbing)
-
-        if primary_hand:
-            self.last_hand_pos3d = smooth_vec3(
-                self.last_hand_pos3d,
-                primary_hand["pos3d"],
-                self.cfg.HAND_SMOOTH
-            )
-            primary_hand["pos3d_smooth"] = self.last_hand_pos3d
-        else:
-            self.last_hand_pos3d = None
-
-        if not primary_hand:
-            self.drag_obj_index = -1
-            self.reset_scaling_state()
+    def _update_anchor_pose(self, detection):
+        if detection is None:
+            self.anchor_visible = False
+            if self._has_anchor_pose():
+                self.anchor_miss_count += 1
+                if self.anchor_miss_count > self.cfg.ANCHOR_MAX_MISSES:
+                    self.anchor_rvec = None
+                    self.anchor_tvec = None
+                    self.anchor_id = None
             return
 
-        hand_px = primary_hand["px"]
-        hand_pos3d = primary_hand["pos3d_smooth"]
+        self.anchor_visible = True
+        self.anchor_miss_count = 0
+        self.anchor_id = detection["id"]
+
+        if self.anchor_rvec is None or self.anchor_tvec is None:
+            self.anchor_rvec = detection["rvec"].copy()
+            self.anchor_tvec = detection["tvec"].copy()
+            return
+
+        a = self.cfg.ANCHOR_SMOOTH
+        self.anchor_rvec = self.anchor_rvec * (1.0 - a) + detection["rvec"] * a
+        self.anchor_tvec = self.anchor_tvec * (1.0 - a) + detection["tvec"] * a
+
+    def _project_marker_points(self, points_world):
+        if not self._has_anchor_pose():
+            return None
+        pts = np.asarray(points_world, dtype=np.float32).reshape(-1, 3)
+        img_pts, _ = cv2.projectPoints(
+            pts,
+            self.anchor_rvec,
+            self.anchor_tvec,
+            self.camera_matrix,
+            self.dist_coeffs,
+        )
+        return [(int(p[0][0]), int(p[0][1])) for p in img_pts]
+
+    def _project_object_center(self, obj, R, w, h):
+        if obj.get("space", "screen") == "marker":
+            pts = self._project_marker_points([obj["pos"]])
+            return None if pts is None else pts[0]
+        return self.holo.get_object_center_projected(obj, R, w, h)
+    
+    
+   
+    def _project_object_vertices(self, obj, verts, R, w, h):
+        if obj.get("space", "screen") == "marker":
+            return self._project_marker_points(verts)
+        return [project(R @ v, w, h, self.cfg.FOV) for v in verts]
+
+    def _screen_to_marker_plane(self, px, py, plane_z):
+        if not self._has_anchor_pose():
+            return None
+
+        fx = float(self.camera_matrix[0, 0])
+        fy = float(self.camera_matrix[1, 1])
+        cx = float(self.camera_matrix[0, 2])
+        cy = float(self.camera_matrix[1, 2])
+
+        ray_cam = np.array([(px - cx) / fx, (py - cy) / fy, 1.0], dtype=np.float32)
+        ray_cam /= max(1e-6, float(np.linalg.norm(ray_cam)))
+
+        rot, _ = cv2.Rodrigues(self.anchor_rvec.astype(np.float32))
+        rot_t = rot.T
+
+        cam_origin_world = -rot_t @ self.anchor_tvec.reshape(3, 1)
+        ray_dir_world = rot_t @ ray_cam.reshape(3, 1)
+
+        dir_z = float(ray_dir_world[2, 0])
+        if abs(dir_z) < 1e-6:
+            return None
+
+        t = (plane_z - float(cam_origin_world[2, 0])) / dir_z
+        if t <= 0.0:
+            return None
+
+        hit = cam_origin_world + ray_dir_world * t
+        return hit[:, 0]
+
+    def run(self):
+        self.log_msg.emit(
+            f"FRIDAY: Kinematic physics online. Gravity={self.cfg.GRAVITY:.3f} u/frame^2."
+        )
+        if self.vision.aruco_available:
+            self.log_msg.emit(
+                f"FRIDAY: ArUco world anchor online. Target ID={self.cfg.ARUCO_TARGET_ID}."
+            )
+        else:
+            self.log_msg.emit("FRIDAY: OpenCV ArUco module not available. Using screen-space mode.")
+
+        while self.running:
+            now = time.time()
+            fps = int(1.0 / (now - self.last_time)) if (now - self.last_time) > 0 else 0
+            self.last_time = now
+
+            if self.cmd_clear:
+                self.objects_3d.clear()
+                self.selected_obj_index = -1
+                self.drag_obj_index = -1
+                self.hud_flash = 1.0
+                self.cmd_clear = False
+                self.log_msg.emit("FRIDAY: Scene purged.")
+
+            if self.cmd_spawn:
+                spawn_space = "marker" if self._has_anchor_pose() else "screen"
+                spawn_pos = [0.0, 0.0, 0.04] if spawn_space == "marker" else [0.0, -0.35, 0.15]
+
+                self.objects_3d.append(
+                    {
+                        "type": self.cmd_spawn,
+                        "space": spawn_space,
+                        "pos": spawn_pos,
+                        "vel": [0.0, 0.0, 0.0],
+                        "scale": 0.35,
+                        "color": self.cfg.STARK_BLUE if self.cmd_spawn == "cube" else self.cfg.STARK_EDGE,
+                        "spawn_t": time.time(),
+                        "rot_x": 0.0,
+                        "rot_y": 0.0,
+                        "rot_z": 0.0,
+                    }
+                )
+                spawned_idx = len(self.objects_3d) - 1
+                self.selected_obj_index = spawned_idx
+                if self.pending_spawn_drag:
+                    self.drag_obj_index = spawned_idx
+                    self.pending_spawn_drag = False
+                self.hud_flash = 1.0
+                self.log_msg.emit(
+                    f"FRIDAY: {self.cmd_spawn.upper()} instantiated in {spawn_space.upper()} space."
+                )
+                self.cmd_spawn = None
+
+            if self.cmd_toggle_bg:
+                self.black_bg_mode = not self.black_bg_mode
+                self.cmd_toggle_bg = False
+
+            if not self.cap.isOpened():
+                time.sleep(0.05)
+                continue
+
+            ok, frame = self.cap.read()
+            if not ok:
+                continue
+      
+            frame = cv2.flip(frame, 1)
+            h, w, _ = frame.shape
+            self._ensure_camera_matrix(w, h)
+
+            aruco_detection = self.vision.process_aruco(frame, self.camera_matrix, self.dist_coeffs)
+            self._update_anchor_pose(aruco_detection)
+
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            t = time.time()
+
+            self.face_offset_x, self.face_offset_y = self.vision.process_face(
+                rgb, self.face_offset_x, self.face_offset_y
+            )
+            R = rot_matrix_x(self.cfg.BASE_ROT_X + self.face_offset_y) @ rot_matrix_y(
+                self.cfg.BASE_ROT_Y - self.face_offset_x
+            )
+            
+            hands = self.vision.process_hands(rgb, w, h)
+            self.handle_interaction(hands[0] if hands else None, hands, R, w, h)
+
+            layers = [np.zeros_like(frame) for _ in range(5)]
+            if hands:
+                self.ui.draw_finger_hud(layers[4], hands[0]["px"], t)
+
+            if aruco_detection is not None and self.vision.aruco_available:
+                marker_ids = np.array([[aruco_detection["id"]]], dtype=np.int32)
+                cv2.aruco.drawDetectedMarkers(layers[4], [aruco_detection["corners"]], marker_ids)
+
+            if self._has_anchor_pose() and self.cfg.DRAW_ANCHOR_AXES:
+                cv2.drawFrameAxes(
+                    layers[4],
+                    self.camera_matrix,
+                    self.dist_coeffs,
+                    self.anchor_rvec,
+                    self.anchor_tvec,
+                    self.cfg.ARUCO_MARKER_LENGTH_M * 0.5,
+                    2,
+                )
+            
+            anchor_txt = f"ARUCO ID {self.anchor_id}" if self._has_anchor_pose() else "ARUCO SEARCH"
+            cv2.putText(
+                layers[4],
+                anchor_txt,
+                (20, 28),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.58,
+                self.cfg.STARK_EDGE,
+                1,
+                cv2.LINE_AA,
+            )
+
+            for i, obj in enumerate(self.objects_3d):
+                is_dragging_this = isinstance(self.drag_obj_index, int) and i == self.drag_obj_index
+                obj_space = obj.get("space", "screen")
+
+                if not is_dragging_this and obj_space == "screen":
+                    obj["vel"][1] += self.cfg.GRAVITY
+                    obj["pos"][0] += obj["vel"][0]
+                    obj["pos"][1] += obj["vel"][1]
+                    obj["pos"][2] += obj["vel"][2]
+                    obj["vel"] = [v * self.cfg.FRICTION for v in obj["vel"]]
+
+                    if obj["pos"][1] > self.cfg.FLOOR_Y:
+                        obj["pos"][1] = self.cfg.FLOOR_Y
+                        obj["vel"][1] *= -self.cfg.BOUNCE
+                        obj["vel"][0] *= 0.8
+                        obj["vel"][2] *= 0.8
+                        if abs(obj["vel"][1]) < 1.0:
+                            obj["vel"][1] = 0.0
+
+                if not is_dragging_this:
+                    obj["rot_y"] = obj.get("rot_y", 0.0) + 0.05
+                    obj["rot_x"] = obj.get("rot_x", 0.0) + 0.02
+
+                verts, faces = self.holo.get_geometry(obj)
+                pts = self._project_object_vertices(obj, verts, R, w, h)
+                if pts is None:
+                    continue
+
+                if i == self.selected_obj_index:
+                    xs = [p[0] for p in pts]
+                    ys = [p[1] for p in pts]
+                    bx, by = min(xs), min(ys)
+                    bw, bh = max(xs) - bx, max(ys) - by
+                    center = self._project_object_center(obj, R, w, h)
+                    if center is not None:
+                        self.ui.draw_selected_hud(layers[4], center, (bx, by, bw, bh), t)
+
+                for face in faces:
+                    poly = np.array([pts[idx] for idx in face], dtype=np.int32)
+                    cv2.polylines(layers[2], [poly], True, self.cfg.STARK_SOFT, 1)
+
+            final = self.holo.compose_final(frame, layers, self.hud_flash, self.black_bg_mode)
+            self.hud_flash *= 0.88
+
+            final_rgb = cv2.cvtColor(final, cv2.COLOR_BGR2RGB)
+            bytes_per_line = final_rgb.shape[2] * final_rgb.shape[1]
+            qt_img = QImage(
+                final_rgb.data,
+                final_rgb.shape[1],
+                final_rgb.shape[0],
+                bytes_per_line,
+                QImage.Format.Format_RGB888,
+            ).copy()
+
+            self.frame_ready.emit(qt_img)
+            self.stats_ready.emit(len(self.objects_3d))
+            self.telemetry_ready.emit(
+                {
+                    "fps": fps,
+                    "hands": len(hands),
+                    "face_yaw": round(self.face_offset_x, 2),
+                    "face_pitch": round(self.face_offset_y, 2),
+                    "anchor": "LOCK" if self._has_anchor_pose() else "SEARCH",
+                    "marker_id": self.anchor_id if self.anchor_id is not None else "--",
+                }
+            )
+
+        if self.cap.isOpened():
+            self.cap.release()
+        self.vision.close()
+
+    def handle_interaction(self, primary, hands, R, w, h):
+        self.gesture.update(primary["grabbing"] if primary else False)
+        if not primary:
+            return
+
+        self.last_hand_pos3d = smooth_vec3(self.last_hand_pos3d, primary["pos3d"], self.cfg.HAND_SMOOTH)
+        px = primary["px"]
 
         if self.gesture.grab_started:
-            if point_in_rect(hand_px, self.cfg.CREATE_CUBE_BTN):
-                self.selected_obj_index = self.create_object("cube", hand_pos3d)
-                self.drag_obj_index = self.selected_obj_index
-
-            elif point_in_rect(hand_px, self.cfg.CREATE_PYRAMID_BTN):
-                self.selected_obj_index = self.create_object("pyramid", hand_pos3d)
-                self.drag_obj_index = self.selected_obj_index
-
-            elif point_in_rect(hand_px, self.cfg.DELETE_BTN):
-                if self.selected_obj_index != -1 and 0 <= self.selected_obj_index < len(self.objects_3d):
-                    self.objects_3d.pop(self.selected_obj_index)
-                    self.selected_obj_index = -1
-                    self.drag_obj_index = -1
-
-            else:
-                picked = self.pick_nearest_object(hand_px, R, w, h)
-                if picked != -1:
-                    self.selected_obj_index = picked
-                    self.drag_obj_index = picked
-                else:
-                    self.selected_obj_index = -1
-                    self.drag_obj_index = -1
-
-        if self.gesture.current_grabbing and self.drag_obj_index != -1 and 0 <= self.drag_obj_index < len(self.objects_3d):
-            obj = self.objects_3d[self.drag_obj_index]
-            obj["pos"] = smooth_vec3(obj["pos"], hand_pos3d, self.cfg.OBJ_DRAG_SMOOTH)
-
-            if len(hand_data) == 2:
-                h1, h2 = hand_data[0], hand_data[1]
-                if h1["grabbing"] and h2["grabbing"]:
-                    dist = math.hypot(h1["px"][0] - h2["px"][0], h1["px"][1] - h2["px"][1])
-                    if self.base_dist_scaling is None:
-                        self.base_dist_scaling = dist
-                        self.base_scale_obj = obj["scale"]
-                    else:
-                        ratio = dist / max(self.base_dist_scaling, 1.0)
-                        obj["scale"] = clamp(
-                            self.base_scale_obj * ratio,
-                            self.cfg.MIN_SCALE,
-                            self.cfg.MAX_SCALE
-                        )
-                else:
-                    self.reset_scaling_state()
-            else:
-                self.reset_scaling_state()
-
-        if self.gesture.grab_ended:
-            self.drag_obj_index = -1
-            self.reset_scaling_state()
-
-    # -----------------------------------------------------
-    # Render helpers
-    # -----------------------------------------------------
-    def draw_button(self, img, rect, label, color):
-        x, y, w, h = rect
-        cv2.rectangle(img, (x, y), (x + w, y + h), color, 2, cv2.LINE_AA)
-        cv2.putText(img, label, (x + 7, y + h + 16),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, self.cfg.WHITE_SOFT, 1, cv2.LINE_AA)
-
-    def draw_finger_hud(self, canvas, pt, t):
-        x, y = pt
-        pulse = 8 + int(5 * (0.5 + 0.5 * math.sin(t * 5.0)))
-        ring2 = 18 + int(4 * (0.5 + 0.5 * math.cos(t * 3.7)))
-        ring3 = 30 + int(6 * (0.5 + 0.5 * math.sin(t * 2.3)))
-
-        cv2.circle(canvas, (x, y), pulse, self.cfg.STARK_EDGE, 1, cv2.LINE_AA)
-        cv2.circle(canvas, (x, y), ring2, self.cfg.STARK_BLUE, 1, cv2.LINE_AA)
-        cv2.circle(canvas, (x, y), ring3, self.cfg.STARK_SOFT, 1, cv2.LINE_AA)
-
-        cv2.line(canvas, (x - 40, y), (x - 14, y), self.cfg.STARK_SOFT, 1, cv2.LINE_AA)
-        cv2.line(canvas, (x + 14, y), (x + 40, y), self.cfg.STARK_SOFT, 1, cv2.LINE_AA)
-        cv2.line(canvas, (x, y - 40), (x, y - 14), self.cfg.STARK_SOFT, 1, cv2.LINE_AA)
-        cv2.line(canvas, (x, y + 14), (x, y + 40), self.cfg.STARK_SOFT, 1, cv2.LINE_AA)
-
-    def draw_selected_hud(self, canvas, center_px, bbox, t):
-        x, y = center_px
-        bx, by, bw, bh = bbox
-
-        cv2.rectangle(canvas, (bx - 10, by - 10), (bx + bw + 10, by + bh + 10),
-                      self.cfg.GREEN_SOFT, 1, cv2.LINE_AA)
-
-        orbit = 24 + int(5 * math.sin(t * 4.0))
-        cv2.circle(canvas, (x, y), orbit, self.cfg.GREEN_SOFT, 1, cv2.LINE_AA)
-        cv2.circle(canvas, (x, y), orbit + 12, self.cfg.CYAN_SOFT, 1, cv2.LINE_AA)
-
-        cv2.putText(canvas, "TRACK LOCK", (bx, by - 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, self.cfg.GREEN_SOFT, 1, cv2.LINE_AA)
-
-    def draw_spawn_effect(self, canvas, center_px, elapsed):
-        if elapsed > 0.7:
-            return
-        x, y = center_px
-        progress = elapsed / 0.7
-        radius = int(12 + progress * 50)
-        alpha_color = self.cfg.STARK_EDGE if progress < 0.5 else self.cfg.CYAN_SOFT
-
-        cv2.circle(canvas, (x, y), radius, alpha_color, 1, cv2.LINE_AA)
-        cv2.circle(canvas, (x, y), max(8, radius // 2), self.cfg.STARK_BLUE, 1, cv2.LINE_AA)
-
-    def draw_world_grid(self, canvas, R, w, h):
-        for gx in np.linspace(-1.7, 1.7, 11):
-            p1 = np.array([gx, 0.9, -1.0], dtype=np.float32)
-            p2 = np.array([gx, 0.9,  1.0], dtype=np.float32)
-            cv2.line(canvas, project(R @ p1, w, h, self.cfg.FOV), project(R @ p2, w, h, self.cfg.FOV),
-                     self.cfg.GRID_COLOR, 1, cv2.LINE_AA)
-
-        for gz in np.linspace(-1.0, 1.0, 11):
-            p1 = np.array([-1.7, 0.9, gz], dtype=np.float32)
-            p2 = np.array([ 1.7, 0.9, gz], dtype=np.float32)
-            cv2.line(canvas, project(R @ p1, w, h, self.cfg.FOV), project(R @ p2, w, h, self.cfg.FOV),
-                     self.cfg.GRID_COLOR, 1, cv2.LINE_AA)
-
-    def draw_axes(self, canvas, R, w, h):
-        origin = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-        x_axis = np.array([0.55, 0.0, 0.0], dtype=np.float32)
-        y_axis = np.array([0.0, -0.55, 0.0], dtype=np.float32)
-        z_axis = np.array([0.0, 0.0, 0.55], dtype=np.float32)
-
-        po = project(R @ origin, w, h, self.cfg.FOV)
-        px = project(R @ x_axis, w, h, self.cfg.FOV)
-        py = project(R @ y_axis, w, h, self.cfg.FOV)
-        pz = project(R @ z_axis, w, h, self.cfg.FOV)
-
-        cv2.line(canvas, po, px, (80, 80, 255), 2, cv2.LINE_AA)
-        cv2.line(canvas, po, py, (80, 255, 80), 2, cv2.LINE_AA)
-        cv2.line(canvas, po, pz, (255, 80, 80), 2, cv2.LINE_AA)
-
-    def draw_radar_hud(self, canvas, t):
-        cx, cy = 130, 170
-        cv2.circle(canvas, (cx, cy), 65, self.cfg.STARK_SOFT, 1, cv2.LINE_AA)
-        cv2.circle(canvas, (cx, cy), 42, self.cfg.STARK_SOFT, 1, cv2.LINE_AA)
-        cv2.circle(canvas, (cx, cy), 20, self.cfg.STARK_SOFT, 1, cv2.LINE_AA)
-
-        angle = t * 1.8
-        x2 = int(cx + math.cos(angle) * 65)
-        y2 = int(cy + math.sin(angle) * 65)
-        cv2.line(canvas, (cx, cy), (x2, y2), self.cfg.STARK_EDGE, 1, cv2.LINE_AA)
-
-        cv2.putText(canvas, "SCAN", (cx - 18, cy + 85),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, self.cfg.STARK_EDGE, 1, cv2.LINE_AA)
-
-    def draw_side_panel(self, img):
-        h, w, _ = img.shape
-        panel_w = 270
-        x0 = w - panel_w - 20
-        y0 = 80
-        y1 = h - 40
-
-        overlay = img.copy()
-        cv2.rectangle(overlay, (x0, y0), (x0 + panel_w, y1), self.cfg.PANEL_BG, -1)
-        cv2.addWeighted(overlay, 0.28, img, 0.72, 0, img)
-
-        cv2.rectangle(img, (x0, y0), (x0 + panel_w, y1), self.cfg.STARK_SOFT, 1, cv2.LINE_AA)
-
-        cv2.putText(img, "SYSTEM PANEL", (x0 + 15, y0 + 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, self.cfg.STARK_EDGE, 1, cv2.LINE_AA)
-
-        lines = [
-            f"Objects: {len(self.objects_3d)}",
-            f"Selected: {self.selected_obj_index if self.selected_obj_index != -1 else 'NONE'}",
-            f"View mode: {'BLACK BG' if self.black_bg_mode else 'NORMAL'}",
-            "Controls:",
-            "- pinch = select / drag",
-            "- 2 hands = scale",
-            "- B = toggle background",
-            "- S = save",
-            "- L = load",
-            "- X = delete selected",
-            "- C = clear scene",
-            "- Q = quit",
-            "",
-            "Buttons:",
-            "[CUBE] [PYRAMID] [DELETE]"
-        ]
-
-        yy = y0 + 60
-        for line in lines:
-            cv2.putText(img, line, (x0 + 15, yy),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.43, self.cfg.WHITE_SOFT, 1, cv2.LINE_AA)
-            yy += 24
-
-        if self.selected_obj_index != -1 and 0 <= self.selected_obj_index < len(self.objects_3d):
-            obj = self.objects_3d[self.selected_obj_index]
-            info = [
-                "",
-                "Object data:",
-                f"type: {obj.get('type', 'cube')}",
-                f"scale: {obj.get('scale', 0):.2f}",
-                f"x: {obj['pos'][0]:.2f}",
-                f"y: {obj['pos'][1]:.2f}",
-                f"z: {obj['pos'][2]:.2f}",
-            ]
-            for line in info:
-                cv2.putText(img, line, (x0 + 15, yy),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.43, self.cfg.CYAN_SOFT, 1, cv2.LINE_AA)
-                yy += 24
-
-    def draw_bottom_hud(self, img):
-        h, _w, _ = img.shape
-        cv2.putText(img, self.cfg.HUD_TITLE, (20, h - 18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.56, self.cfg.WHITE_SOFT, 1, cv2.LINE_AA)
-
-        cv2.putText(img, f"OBJETS: {len(self.objects_3d)}", (20, h - 42),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, self.cfg.STARK_EDGE, 1, cv2.LINE_AA)
-
-        cv2.putText(img, f"SELECTED: {self.selected_obj_index if self.selected_obj_index != -1 else 'NONE'}", (220, h - 42),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, self.cfg.GREEN_SOFT, 1, cv2.LINE_AA)
-
-        mode_text = "MODE: BLACK BG" if self.black_bg_mode else "MODE: NORMAL"
-        cv2.putText(img, mode_text, (450, h - 42),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, self.cfg.CYAN_SOFT, 1, cv2.LINE_AA)
-
-    # -----------------------------------------------------
-    # Render
-    # -----------------------------------------------------
-    def render_scene(self, frame, primary_hand, R, t):
-        h, w, _ = frame.shape
-
-        canvas_grid = np.zeros_like(frame)
-        canvas_faces = np.zeros_like(frame)
-        canvas_wire = np.zeros_like(frame)
-        canvas_fx = np.zeros_like(frame)
-        canvas_hud = np.zeros_like(frame)
-
-        self.draw_world_grid(canvas_grid, R, w, h)
-        self.draw_axes(canvas_grid, R, w, h)
-        self.draw_radar_hud(canvas_hud, t)
-
-        if primary_hand:
-            self.draw_finger_hud(canvas_hud, primary_hand["px"], t)
-
-        all_faces = []
-
-        for obj_idx, obj in enumerate(self.objects_3d):
-            verts, faces = self.get_geometry(obj)
-            rotated_verts = [R @ v for v in verts]
-            projected_pts = [project(v, w, h, self.cfg.FOV) for v in rotated_verts]
-
-            pts_np = np.array(projected_pts, dtype=np.int32)
-            min_x = int(np.min(pts_np[:, 0]))
-            min_y = int(np.min(pts_np[:, 1]))
-            max_x = int(np.max(pts_np[:, 0]))
-            max_y = int(np.max(pts_np[:, 1]))
-            obj["bbox"] = (min_x, min_y, max_x - min_x, max_y - min_y)
-
-            center_world = np.array(obj["pos"], dtype=np.float32)
-            shadow_pos = np.array([center_world[0], 0.9, center_world[2]], dtype=np.float32)
-            shadow_rot = R @ shadow_pos
-            shadow_px = project(shadow_rot, w, h, self.cfg.FOV)
-            shadow_size = int(22 * obj["scale"] * 2.3)
-            cv2.ellipse(canvas_fx, shadow_px, (shadow_size, max(8, shadow_size // 3)),
-                        0, 0, 360, self.cfg.SHADOW_COLOR, -1, cv2.LINE_AA)
-
-            center_px = self.get_object_center_projected(obj, R, w, h)
-            elapsed_spawn = t - obj.get("spawn_t", t)
-            self.draw_spawn_effect(canvas_hud, center_px, elapsed_spawn)
-
-            if obj_idx == self.selected_obj_index:
-                self.draw_selected_hud(canvas_hud, center_px, obj["bbox"], t)
-
-            for face in faces:
-                avg_z = float(np.mean([rotated_verts[idx][2] for idx in face]))
-
-                if len(face) >= 3:
-                    edge1 = rotated_verts[face[1]] - rotated_verts[face[0]]
-                    edge2 = rotated_verts[face[2]] - rotated_verts[face[0]]
-                    normal = safe_normal(np.cross(edge1, edge2))
-                else:
-                    normal = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-
-                all_faces.append({
-                    "obj_idx": obj_idx,
-                    "pts": np.array([projected_pts[idx] for idx in face], dtype=np.int32),
-                    "z": avg_z,
-                    "norm": normal
-                })
-
-        all_faces.sort(key=lambda item: item["z"], reverse=True)
-
-        for face in all_faces:
-            light_dir = safe_normal(np.array([0.22, -1.0, -0.6], dtype=np.float32))
-            intensity = float(clamp(np.dot(face["norm"], light_dir), 0.25, 1.0))
-
-            obj_idx = face["obj_idx"]
-            selected = (obj_idx == self.selected_obj_index)
-            obj = self.objects_3d[obj_idx]
-
-            base_color = np.array(obj["color"], dtype=np.float32)
-            if selected:
-                base_color = np.array(self.cfg.STARK_EDGE, dtype=np.float32)
-
-            shaded = tuple(int(c * intensity) for c in base_color)
-            cv2.fillConvexPoly(canvas_faces, face["pts"], shaded)
-
-            edge_color = self.cfg.GREEN_SOFT if selected else self.cfg.STARK_SOFT
-            edge_thickness = 2 if selected else 1
-            cv2.polylines(canvas_wire, [face["pts"]], True, edge_color, edge_thickness, cv2.LINE_AA)
-
-        return canvas_grid, canvas_faces, canvas_wire, canvas_fx, canvas_hud
-
-    def compose_final(self, frame, layers):
-        canvas_grid, canvas_faces, canvas_wire, canvas_fx, canvas_hud = layers
-
-        glow_grid = cv2.GaussianBlur(canvas_grid, (11, 11), 0)
-        glow_faces = cv2.GaussianBlur(canvas_faces, (25, 25), 0)
-        glow_wire = cv2.GaussianBlur(canvas_wire, (7, 7), 0)
-        glow_fx = cv2.GaussianBlur(canvas_fx, (19, 19), 0)
-        glow_hud = cv2.GaussianBlur(canvas_hud, (9, 9), 0)
-
-        hologram = cv2.addWeighted(canvas_grid, 0.7, glow_grid, 1.0, 0)
-        hologram = cv2.addWeighted(hologram, 1.0, canvas_fx, 0.5, 0)
-        hologram = cv2.addWeighted(hologram, 1.0, glow_fx, 0.9, 0)
-        hologram = cv2.addWeighted(hologram, 1.0, canvas_faces, 0.78, 0)
-        hologram = cv2.addWeighted(hologram, 1.0, glow_faces, 1.25, 0)
-        hologram = cv2.addWeighted(hologram, 1.0, canvas_wire, 1.0, 0)
-        hologram = cv2.addWeighted(hologram, 1.0, glow_wire, 1.45, 0)
-        hologram = cv2.addWeighted(hologram, 1.0, canvas_hud, 0.9, 0)
-        hologram = cv2.addWeighted(hologram, 1.0, glow_hud, 1.1, 0)
-
-        mask = cv2.cvtColor(canvas_faces + canvas_grid + canvas_wire + canvas_hud, cv2.COLOR_BGR2GRAY)
-        _, mask = cv2.threshold(mask, 1, 255, cv2.THRESH_BINARY)
-        alpha = cv2.merge([mask, mask, mask]).astype(np.float32) / 255.0
-
-        base_frame = np.zeros_like(frame) if self.black_bg_mode else frame
-
-        final = (base_frame.astype(np.float32) * (1.0 - alpha * 0.46) +
-                 hologram.astype(np.float32) * (alpha * 0.96)).astype(np.uint8)
-
-        self.draw_button(final, self.cfg.CREATE_CUBE_BTN, "CUBE", self.cfg.STARK_BLUE)
-        self.draw_button(final, self.cfg.CREATE_PYRAMID_BTN, "PYRAMID", self.cfg.CYAN_SOFT)
-        self.draw_button(final, self.cfg.DELETE_BTN, "DELETE", self.cfg.RED_SOFT)
-
-        self.draw_side_panel(final)
-        self.draw_bottom_hud(final)
-
-        if self.hud_flash > 0.01:
-            overlay = final.copy()
-            intensity = clamp(self.hud_flash, 0.0, 1.0)
-            cv2.rectangle(overlay, (0, 0), (final.shape[1], final.shape[0]), self.cfg.STARK_SOFT, -1)
-            cv2.addWeighted(overlay, 0.04 * intensity, final, 1.0 - 0.04 * intensity, 0, final)
-            self.hud_flash *= 0.88
-        else:
-            self.hud_flash = 0.0
-
-        return final
-
-    # -----------------------------------------------------
-    # Keys
-    # -----------------------------------------------------
-    def handle_key(self, key):
-        if key == ord('q'):
-            return False
-        elif key == ord('s'):
-            self.save_scene()
-        elif key == ord('l'):
-            self.load_scene()
-        elif key == ord('x'):
-            if self.selected_obj_index != -1 and 0 <= self.selected_obj_index < len(self.objects_3d):
+            if point_in_rect(px, self.cfg.CREATE_CUBE_BTN):
+                self.cmd_spawn = "cube"
+                self.pending_spawn_drag = True
+                self.drag_obj_index = -1
+            elif point_in_rect(px, self.cfg.CREATE_CORE_BTN):
+                self.cmd_spawn = "core"
+                self.pending_spawn_drag = True
+                self.drag_obj_index = -1
+            elif point_in_rect(px, self.cfg.DELETE_BTN) and self.selected_obj_index != -1:
                 self.objects_3d.pop(self.selected_obj_index)
                 self.selected_obj_index = -1
                 self.drag_obj_index = -1
-        elif key == ord('c'):
-            self.objects_3d.clear()
-            self.selected_obj_index = -1
+                self.log_msg.emit("FRIDAY: Object discarded.")
+            else:
+                best_idx, best_d = -1, self.cfg.PICK_RADIUS
+                for i, obj in enumerate(self.objects_3d):
+                    center = self._project_object_center(obj, R, w, h)
+                    if center is None:
+                        continue
+                    d = math.hypot(px[0] - center[0], px[1] - center[1])
+                    if d < best_d:
+                        best_d, best_idx = d, i
+                self.drag_obj_index = best_idx
+                self.selected_obj_index = best_idx
+                if best_idx != -1:
+                    self.objects_3d[best_idx]["vel"] = [0.0, 0.0, 0.0]
+                    self.log_msg.emit("FRIDAY: Grav-control disabled. Object under manipulation.")
+
+        if self.gesture.current_grabbing and isinstance(self.drag_obj_index, int) and self.drag_obj_index != -1:
+            try:
+                obj = self.objects_3d[self.drag_obj_index]
+                old_pos = list(obj["pos"])
+
+                if obj.get("space", "screen") == "marker" and self._has_anchor_pose():
+                    hit = self._screen_to_marker_plane(px[0], px[1], self.cfg.MARKER_DRAG_PLANE_Z)
+                    if hit is not None:
+                        obj["pos"][0] = float(hit[0])
+                        obj["pos"][1] = float(hit[1])
+                else:
+                    obj["pos"] = smooth_vec3(obj["pos"], self.last_hand_pos3d, self.cfg.OBJ_DRAG_SMOOTH)
+
+                obj["vel"] = [
+                    (obj["pos"][0] - old_pos[0]) * 1.5,
+                    (obj["pos"][1] - old_pos[1]) * 1.5,
+                    (obj["pos"][2] - old_pos[2]) * 1.5,
+                ]
+
+                if len(hands) == 2 and hands[1]["grabbing"]:
+                    x1, y1 = hands[0]["px"]
+                    x2, y2 = hands[1]["px"]
+                    dist = math.hypot(x1 - x2, y1 - y2)
+                    angle = math.atan2(y2 - y1, x2 - x1)
+                    if self.base_dist is None:
+                        self.base_dist = dist
+                        self.base_scale = obj["scale"]
+                        self.base_angle = angle
+                        self.base_rot_z = obj.get("rot_z", 0.0)
+                    else:
+                        obj["scale"] = clamp(
+                            self.base_scale * (dist / max(self.base_dist, 1.0)),
+                            self.cfg.MIN_SCALE,
+                            self.cfg.MAX_SCALE,
+                        )
+                        obj["rot_z"] = self.base_rot_z + (angle - self.base_angle)
+                else:
+                    self.base_dist = None
+            except (IndexError, TypeError):
+                pass
+
+        if self.gesture.grab_ended:
             self.drag_obj_index = -1
-        elif key == ord('b'):
-            self.black_bg_mode = not self.black_bg_mode
-            print(f"🎛️ Modo visual: {'BLACK BG' if self.black_bg_mode else 'NORMAL'}")
-        return True
-
-    # -----------------------------------------------------
-    # Main loop
-    # -----------------------------------------------------
-    def run(self):
-        while self.cap.isOpened():
-            ok, frame = self.cap.read()
-            if not ok:
-                break
-
-            t = time.time()
-
-            frame = cv2.flip(frame, 1)
-            h, w, _ = frame.shape
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-            self.process_face(rgb_frame)
-            R = self.get_scene_rotation()
-
-            hand_data = self.process_hands(rgb_frame, w, h)
-            primary_hand = hand_data[0] if hand_data else None
-
-            self.handle_interaction(primary_hand, hand_data, R, w, h)
-
-            layers = self.render_scene(frame, primary_hand, R, t)
-            final = self.compose_final(frame, layers)
-
-            cv2.imshow(self.cfg.WINDOW_NAME, final)
-
-            key = cv2.waitKey(1) & 0xFF
-            if not self.handle_key(key):
-                break
-
-        self.cap.release()
-        cv2.destroyAllWindows()
+            self.base_dist = None
+            self.log_msg.emit("FRIDAY: Physics restored. Releasing object.")
 
 
-# =========================================================
-# ENTRY POINT
-# =========================================================
+class DexterWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(Config.WINDOW_NAME)
+        self.resize(1280, 800)
+        self.init_ui()
+
+        self.worker = VideoWorker()
+        self.worker.frame_ready.connect(self.update_video)
+        self.worker.stats_ready.connect(self.update_stats)
+        self.worker.log_msg.connect(self.append_log)
+        self.worker.telemetry_ready.connect(self.update_telemetry)
+        self.worker.start()
+
+    def init_ui(self):
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(15, 15, 15, 15)
+        main_layout.setSpacing(15)
+
+        header_label = QLabel("D.E.X.T.E.R. SYSTEM CORE // PROTOCOL ALPHA")
+        header_label.setStyleSheet(
+            "color: #00d2ff; font-family: 'Courier New'; font-size: 18px; font-weight: bold; letter-spacing: 2px;"
+        )
+        header_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        main_layout.addWidget(header_label)
+
+        middle_layout = QHBoxLayout()
+
+        telemetry_panel = QFrame()
+        telemetry_panel.setStyleSheet(
+            "QFrame { background-color: rgba(10, 15, 20, 0.8); border: 1px solid #005577; border-radius: 8px; }"
+        )
+        tel_layout = QVBoxLayout(telemetry_panel)
+
+        lbl_tel_title = QLabel("TELEMETRIA")
+        lbl_tel_title.setStyleSheet(
+            "color: #ff9900; font-weight: bold; font-family: 'Courier New'; font-size: 14px; border: none;"
+        )
+        self.lbl_fps = QLabel("FPS: --")
+        self.lbl_hands = QLabel("Hands: 0")
+        self.lbl_yaw = QLabel("Yaw: 0.0")
+        self.lbl_pitch = QLabel("Pitch: 0.0")
+        self.lbl_anchor = QLabel("Anchor: SEARCH")
+        self.lbl_marker = QLabel("Marker: --")
+
+        for lbl in [
+            lbl_tel_title,
+            self.lbl_fps,
+            self.lbl_hands,
+            self.lbl_yaw,
+            self.lbl_pitch,
+            self.lbl_anchor,
+            self.lbl_marker,
+        ]:
+            if lbl != lbl_tel_title:
+                lbl.setStyleSheet(
+                    "color: #00d2ff; font-family: 'Courier New'; font-size: 13px; border: none;"
+                )
+            tel_layout.addWidget(lbl)
+        tel_layout.addStretch()
+        middle_layout.addWidget(telemetry_panel, stretch=1)
+
+        self.video_label = QLabel("Iniciando Matriz Visual...")
+        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.video_label.setStyleSheet("background-color: #000; border: 2px solid #00d2ff; border-radius: 8px;")
+        self.video_label.setMinimumSize(640, 480)
+        self.video_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        middle_layout.addWidget(self.video_label, stretch=5)
+
+        side_panel = QFrame()
+        side_panel.setStyleSheet(
+            """
+            QFrame { background-color: rgba(10, 15, 20, 0.8); border-radius: 8px; border: 1px solid #005577; }
+            QLabel { color: #00d2ff; font-family: 'Courier New'; font-size: 13px; font-weight: bold; border: none; }
+            QPushButton {
+                background-color: rgba(0, 50, 80, 0.5); color: #00d2ff; border: 1px solid #00d2ff;
+                padding: 12px; border-radius: 4px; font-weight: bold; font-family: 'Courier New';
+            }
+            QPushButton:hover { background-color: #00d2ff; color: #000; box-shadow: 0px 0px 10px #00d2ff; }
+            QPushButton:pressed { background-color: #ffffff; }
+            """
+        )
+        side_layout = QVBoxLayout(side_panel)
+
+        self.obj_count_label = QLabel("Objetos: 0")
+        side_layout.addWidget(self.obj_count_label)
+        side_layout.addSpacing(15)
+
+        btn_cube = QPushButton("INSTANCIAR CUBO")
+        btn_cube.clicked.connect(lambda: setattr(self.worker, "cmd_spawn", "cube"))
+
+        btn_core = QPushButton("INSTANCIAR CORE")
+        btn_core.clicked.connect(lambda: setattr(self.worker, "cmd_spawn", "core"))
+
+        btn_bg = QPushButton("MODO CINEMATICO")
+        btn_bg.clicked.connect(lambda: setattr(self.worker, "cmd_toggle_bg", True))
+
+        btn_clear = QPushButton("PURGAR CENA")
+        btn_clear.clicked.connect(lambda: setattr(self.worker, "cmd_clear", True))
+        btn_clear.setStyleSheet(
+            "QPushButton { color: #ff3333; border-color: #ff3333; } "
+            "QPushButton:hover { background-color: #ff3333; color: black; }"
+        )
+
+        side_layout.addWidget(btn_cube)
+        side_layout.addWidget(btn_core)
+        side_layout.addWidget(btn_bg)
+        side_layout.addSpacing(20)
+        side_layout.addWidget(btn_clear)
+        side_layout.addStretch()
+
+        middle_layout.addWidget(side_panel, stretch=1)
+        main_layout.addLayout(middle_layout, stretch=4)
+
+        console_frame = QFrame()
+        console_frame.setStyleSheet("background-color: #050505; border: 1px solid #333; border-radius: 5px;")
+        console_layout = QVBoxLayout(console_frame)
+        console_layout.setContentsMargins(5, 5, 5, 5)
+
+        self.console = QTextEdit()
+        self.console.setReadOnly(True)
+        self.console.setStyleSheet(
+            "color: #00ff00; background-color: transparent; border: none; "
+            "font-family: 'Consolas', 'Courier New'; font-size: 13px;"
+        )
+        self.console.setFixedHeight(120)
+        console_layout.addWidget(self.console)
+
+        main_layout.addWidget(console_frame, stretch=1)
+
+    def update_video(self, qt_img):
+        if self.video_label.width() > 0 and self.video_label.height() > 0:
+            pixmap = QPixmap.fromImage(qt_img).scaled(
+                self.video_label.width(),
+                self.video_label.height(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self.video_label.setPixmap(pixmap)
+
+    def update_stats(self, count):
+        self.obj_count_label.setText(f"Entidades Ativas: {count}")
+
+    def update_telemetry(self, data):
+        self.lbl_fps.setText(f"Taxa (FPS) : {data['fps']}")
+        self.lbl_hands.setText(f"Maos Detec.: {data['hands']}")
+        self.lbl_yaw.setText(f"Eixo Yaw   : {data['face_yaw']}")
+        self.lbl_pitch.setText(f"Eixo Pitch : {data['face_pitch']}")
+        self.lbl_anchor.setText(f"Anchor     : {data['anchor']}")
+        self.lbl_marker.setText(f"Marker ID  : {data['marker_id']}")
+
+    def append_log(self, msg):
+        time_str = datetime.now().strftime("%H:%M:%S")
+        self.console.append(f"[{time_str}] {msg}")
+        self.console.verticalScrollBar().setValue(self.console.verticalScrollBar().maximum())
+
+    def closeEvent(self, event):
+        self.worker.stop()
+        event.accept()
+
+
 if __name__ == "__main__":
-    try:
-        print("✅ DEXTER v14.0: CLEAN ARCHITECTURE EDITION ONLINE")
-        app = DexterApp()
-        app.run()
-    except Exception as e:
-        print(f"❌ ERRO: {e}")
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    app.setStyleSheet("QMainWindow { background-color: #080a0d; }")
+    window = DexterWindow()
+    window.show()
+    sys.exit(app.exec())
